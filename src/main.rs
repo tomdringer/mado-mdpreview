@@ -65,7 +65,30 @@ impl Span {
 
 // ── Markdown → Block list ─────────────────────────────────────────────────────
 
+fn strip_front_matter(src: &str) -> &str {
+    if !src.starts_with("---") { return src; }
+    let after_open = &src[3..];
+    // Allow "---\n" or "---\r\n"
+    if !after_open.starts_with('\n') && !after_open.starts_with('\r') { return src; }
+    // Find the closing "---" on its own line
+    for (i, _) in after_open.match_indices('\n') {
+        let rest = &after_open[i + 1..];
+        if rest.starts_with("---") {
+            let after_close = &rest[3..];
+            if after_close.is_empty()
+                || after_close.starts_with('\n')
+                || after_close.starts_with('\r')
+            {
+                let skip = after_close.trim_start_matches('\r').trim_start_matches('\n');
+                return skip;
+            }
+        }
+    }
+    src
+}
+
 fn parse_markdown(src: &str) -> Vec<Block> {
+    let src = strip_front_matter(src);
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
@@ -102,11 +125,14 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             Event::End(TagEnd::Paragraph) => {
                 if in_blockquote {
                     blocks.push(Block::Quote(spans.clone()));
-                } else if !in_item {
+                    spans.clear();
+                } else if in_item {
+                    // spans stay alive for End(TagEnd::Item) to capture
+                } else {
                     blocks.push(Block::Text { spans: spans.clone(), indent: 0 });
+                    spans.clear();
                 }
-                blocks.push(Block::Space(6));
-                spans.clear();
+                if !in_item { blocks.push(Block::Space(6)); }
             }
             Event::Start(Tag::Strong)    => { bold = true; }
             Event::End(TagEnd::Strong)   => { bold = false; }
@@ -161,6 +187,8 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             _ => {}
         }
     }
+    // Drop trailing Space blocks so the document doesn't end with a sea of whitespace.
+    while matches!(blocks.last(), Some(Block::Space(_))) { blocks.pop(); }
     blocks
 }
 
@@ -239,7 +267,7 @@ impl Renderer {
     fn draw_str(&mut self, s: &str, x: i32, y: i32, size: f32, fg: [u8; 4], bg: Option<[u8; 4]>) -> i32 {
         let mut cx = x;
         for ch in s.chars() { cx += self.draw_char(ch, cx, y, size, fg, bg); }
-        cx
+        cx - x
     }
 
     fn measure(&self, s: &str, size: f32) -> i32 {
@@ -257,6 +285,42 @@ impl Renderer {
             }
         }
         lines
+    }
+
+    /// Total pixel height of all blocks with the current width, ignoring scroll.
+    fn measure_blocks(&self, blocks: &[Block]) -> i32 {
+        let pad   = 24i32;
+        let max_w = self.width as i32 - pad * 2;
+        let bsz   = 15.0f32;
+        let lh    = 22i32;
+        let mut cy = pad;
+        for block in blocks {
+            match block {
+                Block::Space(px) => { cy += *px as i32; }
+                Block::Rule      => { cy += 12; }
+                Block::Heading { spans, level } => {
+                    let (sz, lh2) = match level {
+                        1 => (28.0f32, 36i32), 2 => (22.0, 30), 3 => (18.0, 26), _ => (16.0, 24),
+                    };
+                    cy += self.wrap_spans(spans, sz, max_w).len() as i32 * lh2;
+                }
+                Block::Text { spans, .. } | Block::Quote(spans) => {
+                    cy += self.wrap_spans(spans, bsz, max_w).len() as i32 * lh;
+                }
+                Block::ListItem { spans, depth } => {
+                    let indent = (*depth as i32 - 1) * 16;
+                    cy += self.wrap_spans(spans, bsz, max_w - 16 - indent).len() as i32 * lh;
+                }
+                Block::OrderedItem { spans, .. } => {
+                    let lw = self.measure("99. ", bsz);
+                    cy += self.wrap_spans(spans, bsz, max_w - lw).len() as i32 * lh;
+                }
+                Block::Code(s) => {
+                    cy += (s.lines().count() as i32 + 1) * lh + 16;
+                }
+            }
+        }
+        cy + pad * 3
     }
 
     fn render(&mut self, blocks: &[Block]) {
@@ -393,7 +457,17 @@ impl Renderer {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+fn dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+        .open("/tmp/mado-mdpreview.log") {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn main() {
+    let _ = std::fs::remove_file("/tmp/mado-mdpreview.log"); // fresh log each run
+    dbg("plugin started");
     let font   = Font::from_bytes(FONT_BYTES, FontSettings::default()).expect("font load failed");
     let state  = Arc::new(Mutex::new(Renderer::new(font, 600, 800)));
     let path:  Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -433,6 +507,7 @@ fn main() {
                 let is_dirty = { let mut d = dir_r.lock().unwrap(); if *d { *d = false; true } else { false } };
                 if is_dirty {
                     let blks = blk_r.lock().unwrap().clone();
+                    dbg(&format!("render: {} blocks", blks.len()));
                     let mut r = state_r.lock().unwrap();
                     r.render(&blks);
                     r.write_frame();
@@ -449,11 +524,24 @@ fn main() {
             "resize" => {
                 let w = val["width"].as_u64().unwrap_or(600) as usize;
                 let h = val["height"].as_u64().unwrap_or(800) as usize;
+                dbg(&format!("resize: {w}x{h}"));
                 state.lock().unwrap().resize(w, h);
                 *dirty.lock().unwrap() = true;
             }
             "file" => {
                 if let Some(p) = val["path"].as_str() {
+                    dbg(&format!("file event: {p}"));
+                    // Parse immediately so the first render has actual content.
+                    // The file watcher thread still handles live updates.
+                    match fs::read_to_string(p) {
+                        Ok(src) => {
+                            dbg(&format!("read ok: {} bytes", src.len()));
+                            *blocks.lock().unwrap() = parse_markdown(&src);
+                        }
+                        Err(e) => {
+                            dbg(&format!("read failed: {e}"));
+                        }
+                    }
                     *path.lock().unwrap() = Some(p.to_string());
                     state.lock().unwrap().scroll_y = 0;
                     *dirty.lock().unwrap() = true;
@@ -461,9 +549,11 @@ fn main() {
             }
             "reload" => { *dirty.lock().unwrap() = true; }
             "scroll" => {
-                let delta = val["delta"].as_i64().unwrap_or(0) as i32;
+                let delta = val["delta"].as_f64().unwrap_or(0.0);
+                let blks  = blocks.lock().unwrap();
                 let mut r = state.lock().unwrap();
-                r.scroll_y = (r.scroll_y - delta * 40).max(0);
+                let max_scroll = (r.measure_blocks(&blks) - r.height as i32).max(0);
+                r.scroll_y = (r.scroll_y - (delta * 40.0) as i32).clamp(0, max_scroll);
                 *dirty.lock().unwrap() = true;
             }
             _ => {}
